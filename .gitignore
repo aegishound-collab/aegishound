@@ -1,0 +1,17 @@
+.env
+# 忽略 Python 虛擬環境
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# 忽略所有機密環境變數檔案（最重要！）
+.env
+*.txt
+# 忽略核心掃描引擎
+core/scan_engine.py
+
+# 如果之前的 scanner.py 也不要推上去，可以一起封鎖
+core/scanner.py
+# 忽略資料庫設定
+core/database.py

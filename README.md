@@ -7,7 +7,7 @@
 一切都是從一個很日常的煩惱開始的：平常玩遊戲的時候，群組裡總是不斷跳出詐騙和廣告機器人的垃圾訊息。當時比起抱怨，我腦中想的是——**「這個痛點，有沒有可能變成商機？」**
 於是我就自己動手寫了一隻 Discord 機器人：讓它常駐在群組裡監聽訊息、第一時間抓出可疑的網址，並在背景深挖它到底是不是惡意的，最後把這些威脅情資累積起來，做成一套可以變現的服務。
 ## 這個 Repo 的定位（請先讀這段）
-這邊放的是專案的 **ChatOps / Discord 機器人層**。真正核心的資安檢測引擎（`ThreatScanner`）和資料庫中樞因為涉及核心機密，**當初我就刻意不放進這個公開版本中**——在架構上，核心被設計成「完全不依賴 Discord、可以獨立運行」，這也是為了把核心邏輯和對外介面拆開，確保安全性。
+這邊放的是專案的 **ChatOps / Discord 機器人層**。真正核心的資安檢測引擎（`AegisScanner`）和資料庫中樞因為涉及核心機密，**當初我就刻意不放進這個公開版本中**——在架構上，核心被設計成「完全不依賴 Discord、可以獨立運行」，這也是為了把核心邏輯和對外介面拆開，確保安全性。
 所以你在這個公開 Repo 看到的，主要是**連線、監聽、攔截、佇列處理**這一層的架構；`core/` 目錄下只保留了空的套件標記（`__init__.py`），實際的掃描邏輯都留在我的私有端。這是刻意設計的資安架構，並不是漏掉檔案喔。
 ---
 ## 系統架構
@@ -16,7 +16,7 @@
 | `main.py` | `AegisHound(commands.Bot)` | 專案的主程式：負責 Discord 連線、環境初始化，並動態載入各個功能模組（Cogs） |
 | `cogs/defense.py` | `UrlDefenseCog` | 第一線防禦：事件驅動，常駐監聽群組訊息並在第一時間抓出網址 |
 | `cogs/queue_worker.py` | `QueueWorkerCog` | 背景非同步任務佇列：負責高併發的緩衝處理，深挖網址的同時不會卡住聊天室 |
-| `core/scanner.py` *(私有)* | `ThreatScanner` | 純資安檢測引擎，不依賴 Discord，可完全獨立運行 |
+| `core/scanner.py` *(私有)* | `AegisScanner` | 純資安檢測引擎，不依賴 Discord，可完全獨立運行 |
 | `core/database.py` *(私有)* | `SecurityDatabase` | 負責黑名單讀寫、SQL 注入防護，以及 VIP 付費狀態的查詢 |
 ### 各模組實作細節
 **1. 主控核心 — `main.py`**
@@ -24,19 +24,20 @@
 *規劃中的擴充*：Phase 4 初始化全域的資料庫連線池（Connection Pool）；Phase 6 非同步啟動 Flask/Django 背景伺服器。
 **2. 第一線防禦監聽 — `cogs/defense.py`**
 專案的事件驅動中心，常駐監聽群組裡的每一條訊息。
-- `on_message(message)`：逐條訊息檢查是否有觸發防禦機制。
-- `_extract_urls(text)`：用 Regex（正規表達式）精準撈出文字中的網址。
-- `_static_check(url)`：進行初步的靜態特徵比對（例如比對 `MALICIOUS_KEYWORDS`）。
-- `report_threat(ctx, url)`：實作 `!ah report` 指令，處理使用者主動回報的情資。
+- `on_message(message)`：逐條訊息檢查是否觸發防禦機制；命中就即刻刪文並發出攔截 Embed 警示，否則把網址送進後台佇列。
+- `_sync_extract_urls(text)`：用 Regex（正規表達式）精準撈出網址，並以 `asyncio.to_thread` 丟到別的執行緒跑，避免卡住事件迴圈。
+- 靜態特徵比對：比對 `MALICIOUS_KEYWORDS`（如 `free-nitro`、`discord-gift`、`crypto-airdrop` 等釣魚常見字），命中即視為惡意。
+- `!ping` / `!stress_test`：健康檢查與壓力測試指令，其中 `!stress_test` 有 owner 權限守門，避免被濫用灌爆佇列。
 **3. 背景非同步任務佇列 — `cogs/queue_worker.py`**
 背景的高併發緩衝區，負責默默消化排隊要深挖的網址，完全不影響前台聊天室的順暢度。
-- `url_scan_loop()`：使用 `tasks.loop` 跑的無窮迴圈，每 0.2 秒從佇列抓取任務。
-- `_defang_url(url)`：將惡意網址「去活化」（例如把 `https` 改成 `hxxps`），防止後台人員測試時誤點。
+- `url_scan_processing()`：使用 `tasks.loop(seconds=3.0)` 跑的背景迴圈，每 3 秒從佇列打包一批（最多 5 筆），再用 `asyncio.gather` 平行丟給核心引擎同時掃描。
+- URL 去活化（Defang）：推播報告前把 `https` 改成 `hxxps`，防止後台人員檢視時誤點惡意連結。
+- `cog_unload()`：模組卸載時主動關閉底層 Executor，避免記憶體洩漏。
 **4. 資安巡檢與圖演算法核心 — `core/scanner.py`（私有）**
-完全不依賴 Discord 的獨立檢測引擎。
-- `scan_url(url, max_depth)`：對外呼叫的主入口。
-- `_bfs_crawl(...)` / `_dfs_crawl(...)`：利用圖形走訪演算法（BFS／DFS）深入爬取網頁 2–3 層的原始碼。
-- `_inspect_vulnerability(html_content)`：巡檢網頁原始碼或目錄，偵測是否不小心曝露了 `.env`、`API_KEY` 或 `.git` 等敏感資訊。
+完全不依賴 Discord 的獨立檢測引擎，以 `AegisScanner(concurrency=10, regex_workers=4)` 建立，內建 Semaphore 與 RateLimiter 保護。
+- `scan(url)`：對外呼叫的主入口，回傳含 `findings`、`errors`、`pages_crawled` 的掃描結果。
+- 圖形走訪：利用 BFS／DFS 深入爬取網頁多層的原始碼（深潛頁數會回報在 `pages_crawled`）。
+- 弱點與敏感資訊巡檢：偵測是否曝露 `.env`、`API_KEY`、`.git`，並對可疑字串計算**熵值（entropy）**輔助判斷，命中會回報 `pattern_name` 與 `entropy`。
 **5. 資料庫安全中樞 — `core/database.py`（私有）**
 負責處理所有 SQL 的讀寫，並全面防範 SQL 注入攻擊（SQL Injection）。
 - `is_blacklisted(url)` / `add_to_blacklist(url, reason)`：黑名單的查詢與寫入。
